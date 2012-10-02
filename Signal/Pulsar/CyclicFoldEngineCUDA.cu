@@ -9,6 +9,8 @@
 
 //#define _DEBUG 1
 
+//#define SET_BINS_GPU 1
+
 #include "dsp/CyclicFoldEngineCUDA.h"
 #include "dsp/MemoryCUDA.h"
 
@@ -196,6 +198,70 @@ uint64_t CUDA::CyclicFoldEngineCUDA::get_bin_hits (int ibin)
 	return hits;
 }
   
+
+__global__ void setBinsKernel(float phase_per_sample,
+				float startph,
+				float endph,
+				unsigned intnturns,
+				unsigned nlag,
+                CUDA::bin* binplan)
+{
+	  unsigned ilaga = threadIdx.x;
+	  unsigned nlaga = blockDim.x;
+	  unsigned ilagb = blockIdx.x;
+	  unsigned ibin = blockIdx.y;
+	  unsigned nbin = gridDim.y;
+	  unsigned ilag = ilagb*nlaga + ilaga;
+	  float minph;
+	  float maxph;
+	  if (ilag >= nlag){
+		  return;
+	  }
+	  unsigned planidx = nlag*ibin+ilag;
+	  unsigned binplan_size = nlag*nbin*intnturns;
+	  unsigned iturn = 0;
+	  while(planidx < binplan_size) {
+		  minph = (ibin*1.0)/nbin + iturn + (ilag*phase_per_sample)/2.0;
+		  maxph = (ibin+1.0)/nbin + iturn + (ilag*phase_per_sample)/2.0;
+		  maxph = min(endph,maxph); // same as if maxph > endph, maxph=endph
+								// keep maxph from going off the end of the data block. In theory we should really pull more data from the next block, but for now
+								// we just ignore correlations that span more than one data block
+
+			if ((minph > endph) || (maxph < minph)) {
+				// if the start of this lag/bin data is past the end of the data block (minph > endph), there is no valid data for this lag/bin
+				// if maxph < minph, then it must be that minph > endph because the only way for this to happen would be if maxph were reassigned to endph in the previous clause.
+				binplan[planidx].offset = 0;
+				binplan[planidx].ibin = 0;
+				binplan[planidx].hits = 0;
+				continue;
+			}
+
+			if (minph > startph){
+				// The basic case, the lag/bin data is fully within the data block, or goes right up to the end of the block (in which case maxph=endph)
+				binplan[planidx].offset = round((minph-startph)/phase_per_sample);
+				binplan[planidx].ibin = ibin;
+				binplan[planidx].hits = round((maxph-minph)/phase_per_sample);
+			}
+			else if (maxph > startph){
+				// In this case, the start of the lag/bin data precedes the first available data point, but there is still valid data from startph to maxph
+			//					cerr << "minph < startph " << minph << " < " << startph << endl;
+				binplan[planidx].offset = 0;
+				binplan[planidx].ibin = ibin;
+				binplan[planidx].hits = round((maxph-startph)/phase_per_sample);
+			}
+			else {
+				// Finally, here minph <= startph and maxph <= startph, so the data needed fully precedes this data block.
+			//					cerr << "maxph < startph " << minph << " < " << startph << endl;
+				binplan[planidx].offset = 0;
+				binplan[planidx].ibin = 0;
+				binplan[planidx].hits = 0;
+			}
+
+			planidx += nlag*nbin;
+
+	  }
+}
+
 // set_bins was added as a more efficient way of setting up the bin plan all in one go, rather than through repeated redundant calculations
 // as was previously done using set_bin
 // The bin plan is indexed as iturn*nbin*nlag + ibin*nlag + ilag
@@ -204,7 +270,6 @@ uint64_t CUDA::CyclicFoldEngineCUDA::get_bin_hits (int ibin)
 uint64_t CUDA::CyclicFoldEngineCUDA::set_bins (double phi, double phase_per_sample, uint64_t _ndat, uint64_t idat_start)
 {
 	cerr << "Got to CUDA::CyclicFoldEngineCUDA::set_bins" << endl;
-
 
 
 	phi = phi - floor(phi); // fractional phase at start
@@ -219,6 +284,8 @@ uint64_t CUDA::CyclicFoldEngineCUDA::set_bins (double phi, double phase_per_samp
 	int planidx;
 
 	int _binplan_size = intnturns*nbin*nlag; // total number of entries in the bin plan.
+
+	ndat_fold = _ndat;
 
 //	cerr << "Start ph:" << startph << " intnturns:" <<intnturns << " _ndat:" << _ndat << " nlag:" << nlag
 //			<< " phase per sample:" << phase_per_sample<< " nturns:" << nturns << endl ;
@@ -239,7 +306,89 @@ uint64_t CUDA::CyclicFoldEngineCUDA::set_bins (double phi, double phase_per_samp
 		    binplan_size = _binplan_size;
 		  }
 	  memset(lagbinplan, 0 , sizeof(bin)*_binplan_size);  // all entries start out with zero hits, so any uninitialized portions will be ignored by the folding threads
-	  ndat_fold = _ndat;
+
+#ifdef SET_BINS_GPU
+
+
+	  uint64_t mem_size = binplan_size * sizeof(bin);
+	  cudaError error;
+
+	  if (d_binplan == NULL) {
+		  cerr << "setbinsgpu no binplan yet allocated" << endl;
+	    error = cudaMalloc ((void **)&(d_binplan),mem_size);
+	    if (error != cudaSuccess)
+	        throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::set_bins_gpu",
+	                     "cudaMalloc orig %s %s",
+	                     stream?"Async":"", cudaGetErrorString (error));
+	  } else {
+		  // original plan was to check if binplan_size < orig_size so as to avoid extraneous free/malloc, but it
+		  // seems that binplan_size gets reset each time before this funciton is called.
+		  //cerr << "orig_size=" << orig_size << "< binplansize=" << binplan_size << "so freeing.." << endl;
+		  error =cudaFree(d_binplan);
+		  if (error != cudaSuccess)
+			  throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::set_bins_gpu",
+						   "cudaFree %s %s",
+						   stream?"Async":"", cudaGetErrorString (error));
+		  cerr << "realocating..." << endl;
+		  error = cudaMalloc ((void **)&(d_binplan),mem_size);
+		  if (error != cudaSuccess)
+			  throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::set_bins_gpu",
+						   "cudaMalloc new %s %s",
+						   stream?"Async":"", cudaGetErrorString (error));
+	  }
+	  cerr << "now have d_binplan: " << d_binplan<< endl;
+	  error = cudaMemset(d_binplan, 0, mem_size);
+	    if (error != cudaSuccess)
+	        throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::set_bins_gpu",
+	                     "cudamemset orig %s %s",
+	                     stream?"Async":"", cudaGetErrorString (error));
+
+	  const unsigned THREADS_PER_BLOCK = 1024;
+	  unsigned nlaga,nlagb;
+	  // if nlag*npol < THREADS_PER_BLOCK then nlaga = nlag, nlagb = 1
+	  // else nlaga = THREADS_PER_BLOCK/npol, nlagb = nlag/nlaga + 1
+	  if (nlag > THREADS_PER_BLOCK) {
+		  nlaga = THREADS_PER_BLOCK;
+		  nlagb = nlag/nlaga + 1;
+	  }
+	  else {
+		  nlagb = 1;
+		  nlaga = nlag;
+	  }
+
+
+	  dim3 blockDim (nlaga, 1, 1);
+	  dim3 gridDim (nlagb, nbin, 1);
+	  cerr << "setnlag=" << nlag;
+	  cerr << "blockDim=" << blockDim.x << "," << blockDim.y << "," << blockDim.z << "," << endl;
+	  cerr << "gridDim="  << gridDim.x << "," << gridDim.y << "," << gridDim.z << "," << endl;
+
+	  unsigned lagbinplan_size = binplan_size;
+
+	  setBinsKernel<<<gridDim,blockDim,0,stream>>>((float)phase_per_sample,
+	  				(float)startph,
+	  				(float)endph,
+	  				intnturns,
+	  				nlag,
+	                d_binplan);
+
+	  cerr << "finished setbins kernel" << endl;
+
+	    cerr << "copying: stream=" << stream << " d_binplan=" << d_binplan << " mem_size=" << mem_size <<
+	  		  " lagbinplan=" << lagbinplan << endl;
+	    // Have to copy binplan back over to get hits on host
+	    if (stream)
+	      error = cudaMemcpyAsync (lagbinplan,d_binplan,mem_size,cudaMemcpyDeviceToHost,stream);
+	    else
+	      error = cudaMemcpy (lagbinplan,d_binplan,mem_size,cudaMemcpyDeviceToHost);
+	    if (error != cudaSuccess)
+	      throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::set_binplan",
+	                   "cudaMemcpy%s %s",
+	                   stream?"Async":"", cudaGetErrorString (error));
+
+
+#else
+
 
 	for (iturn=0;iturn < intnturns; iturn++){
 		for (ibin = 0; ibin < nbin; ibin++) {
@@ -297,6 +446,8 @@ uint64_t CUDA::CyclicFoldEngineCUDA::set_bins (double phi, double phase_per_samp
 			}
 		}
 	}
+#endif
+	cerr << "setbins returning iwth: " << ndat_fold;
 	return ndat_fold;
 }
 
@@ -309,6 +460,8 @@ void CUDA::CyclicFoldEngineCUDA::zero ()
     cudaMemset(d_lagdata, 0, lagdata_size * sizeof(float));
   }
 }
+
+
 
 void CUDA::CyclicFoldEngineCUDA::send_binplan ()
 {
@@ -333,10 +486,11 @@ void CUDA::CyclicFoldEngineCUDA::send_binplan ()
          << endl;
 
   cudaError error;
+#ifndef SET_BINS_GPU
   
   if (d_binplan == NULL) {
 	  cerr << "no binplan yet allocated" << endl;
-    error = cudaMalloc ((void **)&(d_binplan),mem_size); // TODO: is this the right way to do this cudaMalloc call? taken from example online: http://stackoverflow.com/questions/6515303/cuda-cudamalloc
+    error = cudaMalloc ((void **)&(d_binplan),mem_size);
     if (error != cudaSuccess)
         throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::send_binplan",
                      "cudaMalloc orig %s %s",
@@ -383,6 +537,9 @@ void CUDA::CyclicFoldEngineCUDA::send_binplan ()
     throw Error (InvalidState, "CUDA::CyclicFoldEngineCUDA::send_binplan",
                  "cudaMemcpy%s %s", 
                  stream?"Async":"", cudaGetErrorString (error));
+#else
+  cerr << "send_binplan: skipping since we directly set the bins on gpu" << endl;
+#endif
 }
 
 void CUDA::CyclicFoldEngineCUDA::get_lagdata ()
@@ -406,6 +563,8 @@ void CUDA::CyclicFoldEngineCUDA::get_lagdata ()
  *  CUDA Kernels
  *
  */
+
+
 // Since there is a maximum number of threads per block which may be less than the number of lags times number of pols,
 // the ilag index is split into ilag = ilagb*nlaga + ilaga, where nlaga will be such that nlaga*npol = max_threads_per_block
 // Each thread calculates the cyclic correlation for one lag for one bin for one input channel for one pol
@@ -481,7 +640,7 @@ void CUDA::CyclicFoldEngineCUDA::fold ()
 
   // TODO state/etc checks
 
-  cerr << "In CyclicFoldEngineCUDA::fold" << endl;
+  cerr << "In CyclicFoldEngineCUDA::fold d_binplan is: " << d_binplan << endl;
   setup ();
   send_binplan ();
   const unsigned THREADS_PER_BLOCK = 1024;
